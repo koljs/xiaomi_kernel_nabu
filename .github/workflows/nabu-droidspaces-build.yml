@@ -1,22 +1,25 @@
 # ============================================================
 #  小米平板5 (nabu) —— 编译「真正支持 Droidspaces」的内核
 #
-#  背景：Kuugo2002/xiaomi_kernel_nabu 的 v0.1 / v0.2 发布包
-#        全部缺少 Droidspaces 必需配置（作者用旧 defconfig 编译的），
-#        但仓库源码分支里的 defconfig 是完整正确的。
-#        → 从源码重新编译即可得到可用内核。
+#  背景（2026-10-08 实测）：
+#    Kuugo2002/xiaomi_kernel_nabu 的 v0.1 / v0.2 发布包全部缺少
+#    Droidspaces 必需配置。直接拿源码重编，结果**一模一样**。
 #
-#  本工作流相比仓库自带 workflow 的三点增强：
-#    1. 编译前把 Droidspaces 补足片段追加进 defconfig（修复 resukisu 分支缺 USER_NS 的问题）
-#    2. 产出可直接刷入的 AnyKernel3 zip（自带 workflow 只上传解压后的散文件）
-#    3. 编译后自动校验 Image 内嵌配置（官方完整 51 项 + 1 项必须关闭），不合格直接失败
+#  真正根因：
+#    作者的 nabu_defconfig 是「两段式」——前半是设备原生配置，
+#    末尾追加了 Droidspaces 片段。但实测证明 **kconfig 不会采纳文件
+#    尾部这段追加内容**：只出现在尾部的符号（IPC_NS / NETFILTER_XT_SET）
+#    在产物里直接消失；与前半冲突的（SYSVIPC / PID_NS / DEVTMPFS …）
+#    保留前半的值。所以这段片段从来没生效过。
 #
-#  用法：
-#    1. 把本文件放到你 GitHub 仓库的 .github/workflows/ 下
-#    2. Actions → Build nabu kernel (Droidspaces) → Run workflow
-#       分支选 HyperOS1-resukisu（要 ReSukiSU）或 HyperOS1-ksu-next（要 KernelSU-Next）
-#       纯内核不带 root 选 HyperOS1
-#    3. 跑完在 Artifacts 下载 nabu-anykernel3-verified
+#  本工作流的做法（不依赖 defconfig 重复行的语义）：
+#    1. 给 build.sh 打补丁：在 `make defconfig` 之后插入一段
+#       `scripts/config --enable ...` + `make olddefconfig`，
+#       直接改写 .config 并固化 —— 这是内核社区的标准强制配置手段
+#    2. 该插入段还会打印详细诊断（defconfig 尾部 / .config 前后状态）
+#    3. 产出可直接刷入的 AnyKernel3 zip
+#    4. 编译后校验 Image 内嵌配置（官方完整 51 项 + 1 项必须关闭），
+#       不合格直接 fail，杜绝「刷进去才发现不行」
 # ============================================================
 
 name: Build nabu kernel (Droidspaces)
@@ -31,14 +34,14 @@ on:
       branch:
         description: "分支（必须与你的系统版本对应）"
         required: true
-        default: "HyperOS1-resukisu"
+        default: "HyperOS1-ksu-next"
         type: choice
         options:
-          - HyperOS1-resukisu
           - HyperOS1-ksu-next
+          - HyperOS1-resukisu
           - HyperOS1
-          - HyperOS2-resukisu
           - HyperOS2-ksu-next
+          - HyperOS2-resukisu
           - HyperOS2
       device:
         description: "设备代号"
@@ -61,45 +64,84 @@ jobs:
           ref: ${{ inputs.branch }}
           fetch-depth: 1
 
-      - name: 确认 defconfig 里确实有 Droidspaces 配置
+      - name: 给 build.sh 打补丁（defconfig 之后强制写入 Droidspaces 配置）
         shell: bash
         run: |
           set -euo pipefail
-          DEFCONFIG="arch/arm64/configs/${{ inputs.device }}_defconfig"
-          echo "检查 $DEFCONFIG"
-          for k in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_SYSVIPC CONFIG_CGROUP_DEVICE CONFIG_DEVTMPFS; do
-            if grep -q "^${k}=y" "$DEFCONFIG"; then
-              echo "  OK   $k"
-            else
-              echo "  MISS $k  <-- defconfig 缺失，构建中止"
-              exit 1
-            fi
+          mkdir -p .ci
+          cat > .ci/force-ds-config.sh <<'SCRIPT'
+          #!/bin/bash
+          # 由 CI 注入：在 `make defconfig` 之后强制启用 Droidspaces 必需配置。
+          # 参数：$1 = BUILD_DIR（含 .config 的输出目录）  $2 = MAKE_ARGS
+          set -uo pipefail
+
+          BUILD_DIR="$1"
+          MAKE_ARGS="${2:-}"
+          CFG="$BUILD_DIR/.config"
+          DEFCONFIG="arch/arm64/configs/${3:-nabu}_defconfig"
+
+          echo "########## [DIAG] defconfig 尾部 8 行 ##########"
+          tail -8 "$DEFCONFIG"
+
+          echo "########## [DIAG] 目标符号在 defconfig 中的全部出现位置 ##########"
+          for o in SYSVIPC PID_NS IPC_NS USER_NS DEVTMPFS CGROUP_DEVICE CGROUP_PIDS NETFILTER_XT_SET SECCOMP; do
+            hits=$(grep -nE "^(# )?CONFIG_$o(=| is not set)" "$DEFCONFIG" | tr '\n' ' ')
+            printf '  %-22s %s\n' "$o" "${hits:-<未出现>}"
           done
 
-      - name: 补足上游 defconfig 缺失项（追加 Droidspaces 片段）
-        shell: bash
-        run: |
-          set -euo pipefail
-          DEFCONFIG="arch/arm64/configs/${{ inputs.device }}_defconfig"
-          # 追加到文件末尾：kconfig 里后面的赋值覆盖前面的同名项，
-          # 因此可以安全地覆盖上游 defconfig 中已有的 "# CONFIG_X is not set"。
-          cat >> "$DEFCONFIG" <<'EOF'
+          echo "########## [DIAG] make defconfig 之后 .config 的状态 ##########"
+          for o in SYSVIPC PID_NS IPC_NS USER_NS DEVTMPFS CGROUP_DEVICE CGROUP_PIDS NETFILTER_XT_SET SECCOMP CFS_BANDWIDTH; do
+            v=$(grep -E "^(# )?CONFIG_$o(=| is not set)" "$CFG" || echo '<缺失>')
+            printf '  %-22s %s\n' "$o" "$v"
+          done
 
-          # ===== Droidspaces 补足片段（由 CI 自动追加）=====
-          CONFIG_USER_NS=y
-          CONFIG_CFS_BANDWIDTH=y
-          CONFIG_CGROUP_CPUACCT=y
-          CONFIG_CGROUP_NET_PRIO=y
-          CONFIG_CGROUP_FREEZER=y
-          CONFIG_TMPFS_POSIX_ACL=y
-          CONFIG_TMPFS_XATTR=y
-          CONFIG_SECCOMP=y
-          CONFIG_SECCOMP_FILTER=y
-          CONFIG_ANDROID_PARANOID_NETWORK=n
-          # ===== 补足片段结束 =====
-          EOF
-          echo "已追加补足片段，defconfig 现在 $(wc -l < "$DEFCONFIG") 行"
-          grep -n "Droidspaces 补足片段" "$DEFCONFIG"
+          echo "########## 用 scripts/config 强制启用必需配置 ##########"
+          OPTS="SYSCTL SYSVIPC POSIX_MQUEUE NAMESPACES PID_NS UTS_NS IPC_NS NET_NS USER_NS \
+          SECCOMP SECCOMP_FILTER CGROUPS CGROUP_DEVICE CGROUP_SCHED FAIR_GROUP_SCHED \
+          CGROUP_FREEZER CGROUP_NET_PRIO MEMCG CFS_BANDWIDTH CGROUP_PIDS CGROUP_CPUACCT \
+          DEVTMPFS OVERLAY_FS TMPFS_POSIX_ACL TMPFS_XATTR FW_LOADER FW_LOADER_USER_HELPER \
+          VETH BRIDGE NETFILTER BRIDGE_NETFILTER NETFILTER_ADVANCED NF_CONNTRACK \
+          IP_NF_IPTABLES IP_NF_FILTER NF_NAT NF_TABLES IP_NF_TARGET_MASQUERADE \
+          NETFILTER_XT_TARGET_MASQUERADE NETFILTER_XT_TARGET_TCPMSS NETFILTER_XT_MATCH_ADDRTYPE \
+          NF_CONNTRACK_NETLINK IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES NF_CONNTRACK_IPV4 \
+          NF_NAT_IPV4 IP_NF_NAT IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET"
+          for o in $OPTS; do
+            ./scripts/config --file "$CFG" --enable "$o" >/dev/null 2>&1 || echo "  !! $o 设置失败（符号可能不存在于本内核）"
+          done
+          ./scripts/config --file "$CFG" --disable ANDROID_PARANOID_NETWORK >/dev/null 2>&1 || true
+
+          echo "########## make olddefconfig 固化 ##########"
+          make $MAKE_ARGS olddefconfig
+
+          echo "########## [DIAG] 固化之后 .config 的状态 ##########"
+          FAIL=0
+          for o in SYSVIPC PID_NS IPC_NS USER_NS DEVTMPFS CGROUP_DEVICE CGROUP_PIDS NETFILTER_XT_SET SECCOMP CFS_BANDWIDTH; do
+            v=$(grep -E "^(# )?CONFIG_$o(=| is not set)" "$CFG" || echo '<缺失>')
+            printf '  %-22s %s\n' "$o" "$v"
+            case "$v" in
+              "CONFIG_$o=y") ;;
+              *) FAIL=1 ;;
+            esac
+          done
+          if [ "$FAIL" = "1" ]; then
+            echo "!!!!!! 强制后仍有项未生效，产物校验会失败 !!!!!!"
+          else
+            echo "所有关键项已生效"
+          fi
+          SCRIPT
+          chmod +x .ci/force-ds-config.sh
+
+          python3 - <<'PY'
+          p = 'build.sh'
+          s = open(p, encoding='utf-8').read()
+          old = 'make $MAKE_ARGS "${TARGET_DEVICE}_defconfig"'
+          n = s.count(old)
+          assert n == 1, f'build.sh 中该行出现 {n} 次，预期 1 次，无法安全打补丁'
+          injected = old + '\nbash "$SCRIPT_DIR/.ci/force-ds-config.sh" "$BUILD_DIR" "$MAKE_ARGS" "$TARGET_DEVICE"'
+          open(p, 'w', encoding='utf-8').write(s.replace(old, injected))
+          print('build.sh 已打补丁：defconfig 之后将强制写入 Droidspaces 配置')
+          PY
+          grep -n -A2 'force-ds-config.sh' build.sh
 
       - name: 安装 Python 2（内核旧脚本需要）
         shell: bash
@@ -156,7 +198,7 @@ jobs:
           if s < 0:
               sys.exit('Image 中没有内嵌 IKCONFIG，无法校验')
           g = img.find(b'\x1f\x8b\x08', s)
-          cfg = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(img[g:g + 400000])
+          cfg = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(img[g:g + 600000])
           cfg = cfg.split(b'IKCFG_ED')[0].decode('utf-8', 'replace')
           lines = cfg.splitlines()
 
@@ -167,7 +209,7 @@ jobs:
               'CONFIG_NAMESPACES', 'CONFIG_PID_NS', 'CONFIG_UTS_NS', 'CONFIG_IPC_NS', 'CONFIG_NET_NS',
               # Seccomp
               'CONFIG_SECCOMP', 'CONFIG_SECCOMP_FILTER',
-              # Cgroups（4.14 为 v1）
+              # Cgroups（4.14 = v1）
               'CONFIG_CGROUPS', 'CONFIG_CGROUP_DEVICE', 'CONFIG_CGROUP_SCHED',
               'CONFIG_FAIR_GROUP_SCHED', 'CONFIG_CGROUP_FREEZER', 'CONFIG_CGROUP_NET_PRIO',
               'CONFIG_MEMCG', 'CONFIG_CFS_BANDWIDTH', 'CONFIG_CGROUP_PIDS', 'CONFIG_CGROUP_CPUACCT',
@@ -175,21 +217,20 @@ jobs:
               'CONFIG_DEVTMPFS', 'CONFIG_OVERLAY_FS',
               'CONFIG_TMPFS_POSIX_ACL', 'CONFIG_TMPFS_XATTR',
               'CONFIG_FW_LOADER', 'CONFIG_FW_LOADER_USER_HELPER',
-              # 网络隔离 NAT/none
+              # 网络隔离 NAT / none
               'CONFIG_VETH', 'CONFIG_BRIDGE', 'CONFIG_NETFILTER', 'CONFIG_BRIDGE_NETFILTER',
               'CONFIG_NETFILTER_ADVANCED', 'CONFIG_NF_CONNTRACK', 'CONFIG_IP_NF_IPTABLES',
               'CONFIG_IP_NF_FILTER', 'CONFIG_NF_NAT', 'CONFIG_NF_TABLES',
               'CONFIG_IP_NF_TARGET_MASQUERADE', 'CONFIG_NETFILTER_XT_TARGET_MASQUERADE',
               'CONFIG_NETFILTER_XT_TARGET_TCPMSS', 'CONFIG_NETFILTER_XT_MATCH_ADDRTYPE',
               'CONFIG_NF_CONNTRACK_NETLINK', 'CONFIG_IP_ADVANCED_ROUTER', 'CONFIG_IP_MULTIPLE_TABLES',
-              # legacy compat
+              # legacy compat（4.14 需要）
               'CONFIG_NF_CONNTRACK_IPV4', 'CONFIG_NF_NAT_IPV4', 'CONFIG_IP_NF_NAT',
               # ipset
               'CONFIG_IP_SET', 'CONFIG_IP_SET_HASH_IP', 'CONFIG_IP_SET_HASH_NET', 'CONFIG_NETFILTER_XT_SET',
-              # User namespace（容器内跑 Docker 必需）
+              # User namespace（容器内跑 Docker/Podman 必需）
               'CONFIG_USER_NS',
           ]
-          # 必须为 n 的项
           must_off = ['CONFIG_ANDROID_PARANOID_NETWORK']
 
           bad = []
