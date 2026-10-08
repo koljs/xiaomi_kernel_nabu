@@ -1,0 +1,173 @@
+# ============================================================
+#  小米平板5 (nabu) —— 编译「真正支持 Droidspaces」的内核
+#
+#  背景：Kuugo2002/xiaomi_kernel_nabu 的 v0.1 / v0.2 发布包
+#        全部缺少 Droidspaces 必需配置（作者用旧 defconfig 编译的），
+#        但仓库源码分支里的 defconfig 是完整正确的。
+#        → 从源码重新编译即可得到可用内核。
+#
+#  本工作流相比仓库自带 workflow 的两点增强：
+#    1. 产出可直接刷入的 AnyKernel3 zip（自带 workflow 只上传解压后的散文件）
+#    2. 编译后自动校验 Image 内嵌配置，缺 Droidspaces 必需项就直接失败
+#
+#  用法：
+#    1. 把本文件放到你 GitHub 仓库的 .github/workflows/ 下
+#    2. Actions → Build nabu kernel (Droidspaces) → Run workflow
+#       分支选 HyperOS1-resukisu（要 ReSukiSU）或 HyperOS1-ksu-next（要 KernelSU-Next）
+#       纯内核不带 root 选 HyperOS1
+#    3. 跑完在 Artifacts 下载 nabu-anykernel3-verified
+# ============================================================
+
+name: Build nabu kernel (Droidspaces)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "内核源码仓库"
+        required: true
+        default: "Kuugo2002/xiaomi_kernel_nabu"
+      branch:
+        description: "分支（必须与你的系统版本对应）"
+        required: true
+        default: "HyperOS1-resukisu"
+        type: choice
+        options:
+          - HyperOS1-resukisu
+          - HyperOS1-ksu-next
+          - HyperOS1
+          - HyperOS2-resukisu
+          - HyperOS2-ksu-next
+          - HyperOS2
+      device:
+        description: "设备代号"
+        required: true
+        default: "nabu"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: 拉取内核源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.upstream_repo }}
+          ref: ${{ inputs.branch }}
+          fetch-depth: 1
+
+      - name: 确认 defconfig 里确实有 Droidspaces 配置
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEFCONFIG="arch/arm64/configs/${{ inputs.device }}_defconfig"
+          echo "检查 $DEFCONFIG"
+          for k in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_SYSVIPC CONFIG_CGROUP_DEVICE CONFIG_DEVTMPFS; do
+            if grep -q "^${k}=y" "$DEFCONFIG"; then
+              echo "  OK   $k"
+            else
+              echo "  MISS $k  <-- defconfig 缺失，构建中止"
+              exit 1
+            fi
+          done
+
+      - name: 安装 Python 2（内核旧脚本需要）
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f .github/install-python2.sh ]; then
+            sudo env INSTALL_PIP=0 bash "$GITHUB_WORKSPACE/.github/install-python2.sh"
+            echo "/usr/local/bin" >> "$GITHUB_PATH"
+            python2.7 --version
+          else
+            echo "无 install-python2.sh，跳过"
+          fi
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libssl-dev libelf-dev make zip curl python3
+
+      - name: 安装 clang A15 工具链
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/clang-A15.tar.xz"
+          curl --fail --location --retry 3 --output "$archive" \
+            https://github.com/Kuugo2002/xiaomi_kernel_nabu/releases/download/v0.1/clang-A15.tar.xz
+          tar --extract --xz --file "$archive" --directory "$RUNNER_TEMP"
+          test -x "$RUNNER_TEMP/clang-A15/bin/clang"
+          echo "$RUNNER_TEMP/clang-A15/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/clang-A15/bin/clang" --version
+
+      - name: 编译内核
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x build.sh
+          ./build.sh ${{ inputs.device }} -j"$(nproc)"
+
+      - name: 校验产物是否真的支持 Droidspaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, re, sys, zlib
+
+          paths = glob.glob('../Releases_*/arch/arm64/boot/Image')
+          if not paths:
+              sys.exit('未找到编译出的 Image')
+          img = open(paths[0], 'rb').read()
+          print('Image:', paths[0], len(img), 'bytes')
+
+          s = img.find(b'IKCFG_ST')
+          if s < 0:
+              sys.exit('Image 中没有内嵌 IKCONFIG，无法校验')
+          g = img.find(b'\x1f\x8b\x08', s)
+          cfg = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(img[g:g + 400000])
+          cfg = cfg.split(b'IKCFG_ED')[0].decode('utf-8', 'replace')
+          lines = cfg.splitlines()
+
+          need = [
+              'CONFIG_NAMESPACES', 'CONFIG_PID_NS', 'CONFIG_UTS_NS', 'CONFIG_IPC_NS',
+              'CONFIG_NET_NS', 'CONFIG_USER_NS', 'CONFIG_SYSVIPC', 'CONFIG_POSIX_MQUEUE',
+              'CONFIG_SECCOMP_FILTER', 'CONFIG_CGROUP_DEVICE', 'CONFIG_CGROUP_PIDS',
+              'CONFIG_DEVTMPFS', 'CONFIG_OVERLAY_FS', 'CONFIG_NETFILTER_XT_SET',
+          ]
+          bad = []
+          for k in need:
+              hit = [l for l in lines if re.match(r'^(# )?' + k + r'(=| is not set)', l)]
+              st = hit[0] if hit else '<缺失>'
+              print(f'  {k:<30} {st}')
+              if st != k + '=y':
+                  bad.append(k)
+          if bad:
+              sys.exit('产物缺少 Droidspaces 必需配置: ' + ', '.join(bad))
+          print('所有 Droidspaces 必需配置齐全')
+          PY
+
+      - name: 收集 AnyKernel3 刷机包
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          shopt -s nullglob
+          pkgs=(../Releases_*/*.zip)
+          if (( ${#pkgs[@]} == 0 )); then
+            echo "没找到刷机包" >&2; exit 1
+          fi
+          cp -v "${pkgs[@]}" out/
+
+      - name: 上传刷机包
+        uses: actions/upload-artifact@v4
+        with:
+          name: nabu-anykernel3-verified
+          path: out/*.zip
+          if-no-files-found: error
+          retention-days: 30
