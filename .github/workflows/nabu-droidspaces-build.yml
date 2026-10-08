@@ -200,14 +200,36 @@ jobs:
           python3 - <<'PY'
           p = 'build.sh'
           s = open(p, encoding='utf-8').read()
+
+          # (a) 在 defconfig 之后强制写入 Droidspaces 配置
           old = 'make $MAKE_ARGS "${TARGET_DEVICE}_defconfig"'
           n = s.count(old)
-          assert n == 1, f'build.sh 中该行出现 {n} 次，预期 1 次，无法安全打补丁'
-          injected = old + '\nbash "$SCRIPT_DIR/.ci/force-ds-config.sh" "$BUILD_DIR" "$MAKE_ARGS" "$TARGET_DEVICE"'
-          open(p, 'w', encoding='utf-8').write(s.replace(old, injected))
-          print('build.sh 已打补丁：defconfig 之后将强制写入 Droidspaces 配置')
+          assert n == 1, f'build.sh 中 defconfig 行出现 {n} 次，预期 1 次'
+          s = s.replace(old, old + '\nbash "$SCRIPT_DIR/.ci/force-ds-config.sh" "$BUILD_DIR" "$MAKE_ARGS" "$TARGET_DEVICE"')
+
+          # (b)+(c) KernelSU-Next 版本对齐 —— 仅 KernelSU-Next 分支需要
+          #     上游 build.sh 用 `next` 分支的脚本 + `legacy` 参数，会拉到 legacy
+          #     分支 HEAD，其驱动版本(33306)高于最新正式版管理器(33294)，导致管理器
+          #     报「版本过低，KernelSU 无法正常工作」，root 通道起不来。
+          #     ReSukiSU 分支的 build.sh 结构不同，这里自动跳过。
+          KSU_OLD = 'KernelSU-Next/next/kernel/setup.sh" | bash -s legacy'
+          if KSU_OLD in s:
+              s = s.replace(
+                  KSU_OLD,
+                  'KernelSU-Next/v3.4.0-legacy/kernel/setup.sh" | bash -s v3.4.0-legacy')
+              old_cc = 'MAKE_ARGS+=" CROSS_COMPILE=aarch64-linux-gnu-"'
+              assert s.count(old_cc) == 1, 'CROSS_COMPILE 锚点不唯一'
+              s = s.replace(
+                  old_cc,
+                  old_cc + '\nMAKE_ARGS+=" KSU_VERSION_OVERRIDE=33294"')
+              print('已应用 KernelSU-Next 版本对齐补丁（v3.4.0-legacy + 上报版本 33294）')
+          else:
+              print('未检测到 KernelSU-Next 拉取行（可能是 ReSukiSU 分支），跳过版本对齐补丁')
+
+          open(p, 'w', encoding='utf-8').write(s)
+          print('build.sh 补丁完成')
           PY
-          grep -n -A2 'force-ds-config.sh' build.sh
+          grep -n 'force-ds-config.sh\|v3.4.0-legacy\|KSU_VERSION_OVERRIDE\|setup.sh' build.sh
 
           # ---------- 3) 修正 IKCONFIG 数据来源 ----------
           # 本仓库 kernel/Makefile 把 config_data.gz 的来源写死成
