@@ -6,9 +6,10 @@
 #        但仓库源码分支里的 defconfig 是完整正确的。
 #        → 从源码重新编译即可得到可用内核。
 #
-#  本工作流相比仓库自带 workflow 的两点增强：
-#    1. 产出可直接刷入的 AnyKernel3 zip（自带 workflow 只上传解压后的散文件）
-#    2. 编译后自动校验 Image 内嵌配置，缺 Droidspaces 必需项就直接失败
+#  本工作流相比仓库自带 workflow 的三点增强：
+#    1. 编译前把 Droidspaces 补足片段追加进 defconfig（修复 resukisu 分支缺 USER_NS 的问题）
+#    2. 产出可直接刷入的 AnyKernel3 zip（自带 workflow 只上传解压后的散文件）
+#    3. 编译后自动校验 Image 内嵌配置（官方完整 51 项 + 1 项必须关闭），不合格直接失败
 #
 #  用法：
 #    1. 把本文件放到你 GitHub 仓库的 .github/workflows/ 下
@@ -75,6 +76,31 @@ jobs:
             fi
           done
 
+      - name: 补足上游 defconfig 缺失项（追加 Droidspaces 片段）
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEFCONFIG="arch/arm64/configs/${{ inputs.device }}_defconfig"
+          # 追加到文件末尾：kconfig 里后面的赋值覆盖前面的同名项，
+          # 因此可以安全地覆盖上游 defconfig 中已有的 "# CONFIG_X is not set"。
+          cat >> "$DEFCONFIG" <<'EOF'
+
+          # ===== Droidspaces 补足片段（由 CI 自动追加）=====
+          CONFIG_USER_NS=y
+          CONFIG_CFS_BANDWIDTH=y
+          CONFIG_CGROUP_CPUACCT=y
+          CONFIG_CGROUP_NET_PRIO=y
+          CONFIG_CGROUP_FREEZER=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_SECCOMP=y
+          CONFIG_SECCOMP_FILTER=y
+          CONFIG_ANDROID_PARANOID_NETWORK=n
+          # ===== 补足片段结束 =====
+          EOF
+          echo "已追加补足片段，defconfig 现在 $(wc -l < "$DEFCONFIG") 行"
+          grep -n "Droidspaces 补足片段" "$DEFCONFIG"
+
       - name: 安装 Python 2（内核旧脚本需要）
         shell: bash
         run: |
@@ -135,21 +161,53 @@ jobs:
           lines = cfg.splitlines()
 
           need = [
-              'CONFIG_NAMESPACES', 'CONFIG_PID_NS', 'CONFIG_UTS_NS', 'CONFIG_IPC_NS',
-              'CONFIG_NET_NS', 'CONFIG_USER_NS', 'CONFIG_SYSVIPC', 'CONFIG_POSIX_MQUEUE',
-              'CONFIG_SECCOMP_FILTER', 'CONFIG_CGROUP_DEVICE', 'CONFIG_CGROUP_PIDS',
-              'CONFIG_DEVTMPFS', 'CONFIG_OVERLAY_FS', 'CONFIG_NETFILTER_XT_SET',
+              # IPC 机制
+              'CONFIG_SYSCTL', 'CONFIG_SYSVIPC', 'CONFIG_POSIX_MQUEUE',
+              # 核心命名空间
+              'CONFIG_NAMESPACES', 'CONFIG_PID_NS', 'CONFIG_UTS_NS', 'CONFIG_IPC_NS', 'CONFIG_NET_NS',
+              # Seccomp
+              'CONFIG_SECCOMP', 'CONFIG_SECCOMP_FILTER',
+              # Cgroups（4.14 为 v1）
+              'CONFIG_CGROUPS', 'CONFIG_CGROUP_DEVICE', 'CONFIG_CGROUP_SCHED',
+              'CONFIG_FAIR_GROUP_SCHED', 'CONFIG_CGROUP_FREEZER', 'CONFIG_CGROUP_NET_PRIO',
+              'CONFIG_MEMCG', 'CONFIG_CFS_BANDWIDTH', 'CONFIG_CGROUP_PIDS', 'CONFIG_CGROUP_CPUACCT',
+              # 文件系统
+              'CONFIG_DEVTMPFS', 'CONFIG_OVERLAY_FS',
+              'CONFIG_TMPFS_POSIX_ACL', 'CONFIG_TMPFS_XATTR',
+              'CONFIG_FW_LOADER', 'CONFIG_FW_LOADER_USER_HELPER',
+              # 网络隔离 NAT/none
+              'CONFIG_VETH', 'CONFIG_BRIDGE', 'CONFIG_NETFILTER', 'CONFIG_BRIDGE_NETFILTER',
+              'CONFIG_NETFILTER_ADVANCED', 'CONFIG_NF_CONNTRACK', 'CONFIG_IP_NF_IPTABLES',
+              'CONFIG_IP_NF_FILTER', 'CONFIG_NF_NAT', 'CONFIG_NF_TABLES',
+              'CONFIG_IP_NF_TARGET_MASQUERADE', 'CONFIG_NETFILTER_XT_TARGET_MASQUERADE',
+              'CONFIG_NETFILTER_XT_TARGET_TCPMSS', 'CONFIG_NETFILTER_XT_MATCH_ADDRTYPE',
+              'CONFIG_NF_CONNTRACK_NETLINK', 'CONFIG_IP_ADVANCED_ROUTER', 'CONFIG_IP_MULTIPLE_TABLES',
+              # legacy compat
+              'CONFIG_NF_CONNTRACK_IPV4', 'CONFIG_NF_NAT_IPV4', 'CONFIG_IP_NF_NAT',
+              # ipset
+              'CONFIG_IP_SET', 'CONFIG_IP_SET_HASH_IP', 'CONFIG_IP_SET_HASH_NET', 'CONFIG_NETFILTER_XT_SET',
+              # User namespace（容器内跑 Docker 必需）
+              'CONFIG_USER_NS',
           ]
+          # 必须为 n 的项
+          must_off = ['CONFIG_ANDROID_PARANOID_NETWORK']
+
           bad = []
           for k in need:
               hit = [l for l in lines if re.match(r'^(# )?' + k + r'(=| is not set)', l)]
               st = hit[0] if hit else '<缺失>'
-              print(f'  {k:<30} {st}')
+              print(f'  {k:<42} {st}')
               if st != k + '=y':
                   bad.append(k)
+          for k in must_off:
+              hit = [l for l in lines if re.match(r'^(# )?' + k + r'(=| is not set)', l)]
+              st = hit[0] if hit else '<缺失>'
+              print(f'  {k:<42} {st}  (必须关闭)')
+              if st != '# ' + k + ' is not set':
+                  bad.append(k)
           if bad:
-              sys.exit('产物缺少 Droidspaces 必需配置: ' + ', '.join(bad))
-          print('所有 Droidspaces 必需配置齐全')
+              sys.exit('产物缺少/未关闭 Droidspaces 必需配置: ' + ', '.join(bad))
+          print(f'全部 {len(need)} 项必需配置齐全，{len(must_off)} 项必须关闭项已关闭')
           PY
 
       - name: 收集 AnyKernel3 刷机包
@@ -167,7 +225,7 @@ jobs:
       - name: 上传刷机包
         uses: actions/upload-artifact@v4
         with:
-          name: nabu-anykernel3-verified
+          name: nabu-anykernel3-${{ inputs.branch }}
           path: out/*.zip
           if-no-files-found: error
           retention-days: 30
