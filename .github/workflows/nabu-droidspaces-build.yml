@@ -87,7 +87,10 @@ jobs:
           NF_CT_NETLINK IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES NF_CONNTRACK_IPV4
           NF_NAT_IPV4 IP_NF_NAT IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET
           IPV6_MULTIPLE_TABLES IP6_NF_IPTABLES IP6_NF_FILTER IP6_NF_MANGLE IP6_NF_NAT
-          IP6_NF_TARGET_MASQUERADE NF_CONNTRACK_IPV6 NF_NAT_IPV6""".split()
+          IP6_NF_TARGET_MASQUERADE NF_CONNTRACK_IPV6 NF_NAT_IPV6
+          MODULES MODULE_UNLOAD MODVERSIONS STRICT_MODULE_RWX
+          AUDIT MAGIC_SYSRQ CC_STACKPROTECTOR_STRONG DEBUG_LIST PROFILING
+          FS_VERITY_BUILTIN_SIGNATURES""".split()
           VIS = "EXPERT EMBEDDED MULTIUSER".split()
           OFF = ["ANDROID_PARANOID_NETWORK"]
 
@@ -170,7 +173,10 @@ jobs:
           IP_NF_IPTABLES IP_NF_FILTER NF_NAT NF_TABLES IP_NF_TARGET_MASQUERADE \
           NETFILTER_XT_TARGET_MASQUERADE NETFILTER_XT_TARGET_TCPMSS NETFILTER_XT_MATCH_ADDRTYPE \
           NF_CT_NETLINK IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES NF_CONNTRACK_IPV4 \
-          NF_NAT_IPV4 IP_NF_NAT IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET"
+          NF_NAT_IPV4 IP_NF_NAT IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET \
+          MODULES MODULE_UNLOAD MODVERSIONS STRICT_MODULE_RWX \
+          AUDIT MAGIC_SYSRQ CC_STACKPROTECTOR_STRONG DEBUG_LIST PROFILING \
+          FS_VERITY_BUILTIN_SIGNATURES"
           for o in $OPTS; do
             ./scripts/config --file "$CFG" --enable "$o" >/dev/null 2>&1 || echo "  !! $o 设置失败（符号可能不存在于本内核）"
           done
@@ -315,13 +321,39 @@ jobs:
                    IP_NF_IPTABLES IP_NF_FILTER NF_NAT IP_NF_TARGET_MASQUERADE \
                    NETFILTER_XT_TARGET_TCPMSS IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES \
                    NF_CONNTRACK_IPV4 NF_NAT_IPV4 IP_NF_NAT IP_SET IP_SET_HASH_IP \
-                   IP_SET_HASH_NET NETFILTER_XT_SET; do
+                   IP_SET_HASH_NET NETFILTER_XT_SET \
+                   MODULES MODULE_UNLOAD MODVERSIONS STRICT_MODULE_RWX \
+                   AUDIT MAGIC_SYSRQ CC_STACKPROTECTOR_STRONG DEBUG_LIST PROFILING \
+                   FS_VERITY_BUILTIN_SIGNATURES; do
             grep -qE "^CONFIG_$o=y" "$CFG" || BAD="$BAD $o"
           done
           if [ -n "$BAD" ]; then
             echo "!! .config 缺少:$BAD"; exit 1
           fi
           echo "  .config 全部必需项为 =y，通过"
+
+          # 安全阀：启用 CONFIG_MODULES 后，确认没有启动关键驱动被编成模块(=m)
+          # 这些驱动若变成模块且未安装，设备会无法开机。
+          echo "########## 安全阀：检查 =m 符号 ##########"
+          MODS=$(grep -cE '^CONFIG_[A-Z0-9_]+=m$' "$CFG" || true)
+          echo "  =m 符号总数: $MODS"
+          CRIT="CONFIG_MMC CONFIG_MMC_BLOCK CONFIG_MMC_SDHCI CONFIG_SCSI_UFSHCD CONFIG_SCSI_UFS_QCOM \
+          CONFIG_EXT4_FS CONFIG_F2FS_FS CONFIG_BLK_DEV_INITRD CONFIG_BLK_DEV_LOOP CONFIG_DM_VERITY \
+          CONFIG_DRM CONFIG_DRM_MSM CONFIG_QCOM_CLK_SMD_RPM CONFIG_PINCTRL CONFIG_PINCTRL_MSM \
+          CONFIG_REGULATOR CONFIG_USB CONFIG_PHY_QCOM_QMP CONFIG_QCOM_SMEM CONFIG_ARM_SMMU \
+          CONFIG_QCOM_SCM CONFIG_SPMI CONFIG_I2C CONFIG_QCOM_GENI_SE CONFIG_SERIAL_MSM_GENI \
+          CONFIG_RTC_CLASS CONFIG_SCHED_WALT CONFIG_CRYPTO_DEV_QCE CONFIG_DEVTMPFS CONFIG_TMPFS"
+          BADMOD=""
+          for c in $CRIT; do
+            if grep -qE "^$c=m$" "$CFG"; then BADMOD="$BADMOD $c"; fi
+          done
+          if [ -n "$BADMOD" ]; then
+            echo "!! 以下启动关键驱动被编成了模块，刷机会无法开机:$BADMOD"
+            exit 1
+          fi
+          echo "  启动关键驱动均未变成模块，通过"
+          echo "  全部 =m 符号清单："
+          grep -E '^CONFIG_[A-Z0-9_]+=m$' "$CFG" | sed 's/^/    /' | head -60
 
           # 硬校验 2：Image 内嵌配置必须与 .config 一致（证明 IKCONFIG 修补生效）
           python3 - <<'PY'
