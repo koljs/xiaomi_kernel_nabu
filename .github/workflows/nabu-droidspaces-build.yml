@@ -209,6 +209,23 @@ jobs:
           PY
           grep -n -A2 'force-ds-config.sh' build.sh
 
+          # ---------- 3) 修正 IKCONFIG 数据来源 ----------
+          # 本仓库 kernel/Makefile 把 config_data.gz 的来源写死成
+          # arch/arm64/configs/nabu-stock_defconfig（一份原厂配置静态副本），
+          # 导致 Image 内嵌配置 与 设备上的 /proc/config.gz 都不反映真实编译配置。
+          # 改为指向 $(KCONFIG_CONFIG)（即 .config），让配置可被如实验证。
+          python3 - <<'PY'
+          p = 'kernel/Makefile'
+          s = open(p, encoding='utf-8').read()
+          old = '$(obj)/config_data.gz: arch/arm64/configs/nabu-stock_defconfig FORCE'
+          new = '$(obj)/config_data.gz: $(KCONFIG_CONFIG) FORCE'
+          n = s.count(old)
+          assert n == 1, f'kernel/Makefile 中该行出现 {n} 次，预期 1 次'
+          open(p, 'w', encoding='utf-8').write(s.replace(old, new))
+          print('kernel/Makefile 已修正：IKCONFIG 数据源 -> $(KCONFIG_CONFIG)')
+          PY
+          grep -n 'config_data.gz:' kernel/Makefile
+
       - name: 安装 Python 2（内核旧脚本需要）
         shell: bash
         run: |
@@ -264,6 +281,27 @@ jobs:
             printf '  %-22s %s\n' "$o" "$v"
           done
 
+          # 硬校验 1：编译真正使用的 .config 必须齐全（这是内核功能的真实来源）
+          echo "########## 校验 .config（内核功能真实来源）##########"
+          CFG=$(ls ../Releases_*/.config)
+          BAD=""
+          for o in SYSCTL SYSVIPC POSIX_MQUEUE NAMESPACES PID_NS UTS_NS IPC_NS NET_NS USER_NS \
+                   SECCOMP SECCOMP_FILTER CGROUPS CGROUP_DEVICE CGROUP_SCHED FAIR_GROUP_SCHED \
+                   CGROUP_FREEZER CGROUP_NET_PRIO MEMCG CGROUP_PIDS CGROUP_CPUACCT \
+                   DEVTMPFS OVERLAY_FS TMPFS_POSIX_ACL TMPFS_XATTR FW_LOADER FW_LOADER_USER_HELPER \
+                   VETH BRIDGE NETFILTER BRIDGE_NETFILTER NETFILTER_ADVANCED NF_CONNTRACK \
+                   IP_NF_IPTABLES IP_NF_FILTER NF_NAT IP_NF_TARGET_MASQUERADE \
+                   NETFILTER_XT_TARGET_TCPMSS IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES \
+                   NF_CONNTRACK_IPV4 NF_NAT_IPV4 IP_NF_NAT IP_SET IP_SET_HASH_IP \
+                   IP_SET_HASH_NET NETFILTER_XT_SET; do
+            grep -qE "^CONFIG_$o=y" "$CFG" || BAD="$BAD $o"
+          done
+          if [ -n "$BAD" ]; then
+            echo "!! .config 缺少:$BAD"; exit 1
+          fi
+          echo "  .config 全部必需项为 =y，通过"
+
+          # 硬校验 2：Image 内嵌配置必须与 .config 一致（证明 IKCONFIG 修补生效）
           python3 - <<'PY'
           import glob, re, sys, zlib
 
