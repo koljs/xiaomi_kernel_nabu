@@ -353,7 +353,9 @@ jobs:
           fi
           echo "  启动关键驱动均未变成模块，通过"
           echo "  全部 =m 符号清单："
-          grep -E '^CONFIG_[A-Z0-9_]+=m$' "$CFG" | sed 's/^/    /' | head -60
+          # 注意：没有 =m 符号时 grep 返回 1，配合 set -o pipefail 会误判为致命错误，
+          # 所以这里必须用 `|| true` 兜住整条管道。
+          { grep -E '^CONFIG_[A-Z0-9_]+=m$' "$CFG" | sed 's/^/    /' | head -60; } || true
 
           # 硬校验 2：Image 内嵌配置必须与 .config 一致（证明 IKCONFIG 修补生效）
           python3 - <<'PY'
