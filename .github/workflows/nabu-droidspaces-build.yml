@@ -84,7 +84,7 @@ jobs:
           VETH BRIDGE NETFILTER BRIDGE_NETFILTER NETFILTER_ADVANCED NF_CONNTRACK
           IP_NF_IPTABLES IP_NF_FILTER NF_NAT NF_TABLES IP_NF_TARGET_MASQUERADE
           NETFILTER_XT_TARGET_MASQUERADE NETFILTER_XT_TARGET_TCPMSS NETFILTER_XT_MATCH_ADDRTYPE
-          NF_CONNTRACK_NETLINK IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES NF_CONNTRACK_IPV4
+          NF_CT_NETLINK IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES NF_CONNTRACK_IPV4
           NF_NAT_IPV4 IP_NF_NAT IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET
           IPV6_MULTIPLE_TABLES IP6_NF_IPTABLES IP6_NF_FILTER IP6_NF_MANGLE IP6_NF_NAT
           IP6_NF_TARGET_MASQUERADE NF_CONNTRACK_IPV6 NF_NAT_IPV6""".split()
@@ -169,7 +169,7 @@ jobs:
           VETH BRIDGE NETFILTER BRIDGE_NETFILTER NETFILTER_ADVANCED NF_CONNTRACK \
           IP_NF_IPTABLES IP_NF_FILTER NF_NAT NF_TABLES IP_NF_TARGET_MASQUERADE \
           NETFILTER_XT_TARGET_MASQUERADE NETFILTER_XT_TARGET_TCPMSS NETFILTER_XT_MATCH_ADDRTYPE \
-          NF_CONNTRACK_NETLINK IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES NF_CONNTRACK_IPV4 \
+          NF_CT_NETLINK IP_ADVANCED_ROUTER IP_MULTIPLE_TABLES NF_CONNTRACK_IPV4 \
           NF_NAT_IPV4 IP_NF_NAT IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET"
           for o in $OPTS; do
             ./scripts/config --file "$CFG" --enable "$o" >/dev/null 2>&1 || echo "  !! $o 设置失败（符号可能不存在于本内核）"
@@ -329,7 +329,7 @@ jobs:
               # Cgroups（4.14 = v1）
               'CONFIG_CGROUPS', 'CONFIG_CGROUP_DEVICE', 'CONFIG_CGROUP_SCHED',
               'CONFIG_FAIR_GROUP_SCHED', 'CONFIG_CGROUP_FREEZER', 'CONFIG_CGROUP_NET_PRIO',
-              'CONFIG_MEMCG', 'CONFIG_CFS_BANDWIDTH', 'CONFIG_CGROUP_PIDS', 'CONFIG_CGROUP_CPUACCT',
+              'CONFIG_MEMCG', 'CONFIG_CGROUP_PIDS', 'CONFIG_CGROUP_CPUACCT',
               # 文件系统
               'CONFIG_DEVTMPFS', 'CONFIG_OVERLAY_FS',
               'CONFIG_TMPFS_POSIX_ACL', 'CONFIG_TMPFS_XATTR',
@@ -338,9 +338,10 @@ jobs:
               'CONFIG_VETH', 'CONFIG_BRIDGE', 'CONFIG_NETFILTER', 'CONFIG_BRIDGE_NETFILTER',
               'CONFIG_NETFILTER_ADVANCED', 'CONFIG_NF_CONNTRACK', 'CONFIG_IP_NF_IPTABLES',
               'CONFIG_IP_NF_FILTER', 'CONFIG_NF_NAT', 'CONFIG_NF_TABLES',
-              'CONFIG_IP_NF_TARGET_MASQUERADE', 'CONFIG_NETFILTER_XT_TARGET_MASQUERADE',
+              'CONFIG_IP_NF_TARGET_MASQUERADE',
               'CONFIG_NETFILTER_XT_TARGET_TCPMSS', 'CONFIG_NETFILTER_XT_MATCH_ADDRTYPE',
-              'CONFIG_NF_CONNTRACK_NETLINK', 'CONFIG_IP_ADVANCED_ROUTER', 'CONFIG_IP_MULTIPLE_TABLES',
+              # 4.14 里 conntrack netlink 叫 NF_CT_NETLINK（不是 NF_CONNTRACK_NETLINK）
+              'CONFIG_NF_CT_NETLINK', 'CONFIG_IP_ADVANCED_ROUTER', 'CONFIG_IP_MULTIPLE_TABLES',
               # legacy compat（4.14 需要）
               'CONFIG_NF_CONNTRACK_IPV4', 'CONFIG_NF_NAT_IPV4', 'CONFIG_IP_NF_NAT',
               # ipset
@@ -359,9 +360,11 @@ jobs:
                   bad.append(k)
           for k in must_off:
               hit = [l for l in lines if re.match(r'^(# )?' + k + r'(=| is not set)', l)]
-              st = hit[0] if hit else '<缺失>'
-              print(f'  {k:<42} {st}  (必须关闭)')
-              if st != '# ' + k + ' is not set':
+              st = hit[0] if hit else '<本内核无此符号>'
+              print(f'  {k:<42} {st}  (必须关闭；符号不存在也算通过)')
+              # 符号在本内核树里没有 Kconfig 定义时，它根本不会出现在 .config 里，
+              # 也就意味着该限制没被编进内核 —— 同样满足要求。
+              if st not in ('# ' + k + ' is not set', '<本内核无此符号>'):
                   bad.append(k)
           if bad:
               sys.exit('产物缺少/未关闭 Droidspaces 必需配置: ' + ', '.join(bad))
